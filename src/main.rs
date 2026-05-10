@@ -29,7 +29,7 @@ impl EventHandler for Handler {
         }
 
         // URLをfxtwitter.comに置換
-        let new_content = self.twitter_re.replace_all(content, "fxtwitter.com");
+        let new_content = self.twitter_re.replace_all(content, "https://fxtwitter.com$2");
 
         // 元メッセージを削除
         if let Err(e) = msg.delete(&ctx.http).await {
@@ -56,7 +56,7 @@ async fn main() {
     let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
     let handler = Handler {
-        twitter_re: Regex::new(r"https?://(twitter\.com|x\.com)/").unwrap(),
+        twitter_re: Regex::new(r"https?://(twitter\.com|x\.com)(/\S*)?").unwrap(),
     };
 
     let mut client = Client::builder(&token, intents)
