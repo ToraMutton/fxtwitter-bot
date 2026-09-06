@@ -10,6 +10,10 @@ const MEDALS: [&str; 3] = ["🥇", "🥈", "🥉"];
 /// ツイート本文を1行で見せるときの長さ
 const SNIPPET_LEN: usize = 80;
 
+/// ハッシュタグとして表示する長さ。
+/// Twitter のハッシュタグは文章のように長いものがあり、そのまま並べると崩れる。
+const TAG_LEN: usize = 16;
+
 /// FxTwitter API から得られた「あれば載せる」情報。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Highlights {
@@ -49,15 +53,20 @@ impl Period {
     }
 }
 
+/// 指定した文字数を超えたら省略記号を付けて切り詰める。
+fn shorten(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push('…');
+    out
+}
+
 /// ツイート本文を1行に収まる長さへ整える。
 fn snippet(text: &str) -> String {
     let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.chars().count() <= SNIPPET_LEN {
-        return single_line;
-    }
-    let mut out: String = single_line.chars().take(SNIPPET_LEN).collect();
-    out.push('…');
-    out
+    shorten(&single_line, SNIPPET_LEN)
 }
 
 /// Discord のメンションや装飾として解釈されうる文字を無効化する。
@@ -154,7 +163,7 @@ pub fn format_report(
             .hashtags
             .iter()
             .take(5)
-            .map(|(tag, count)| format!("`#{tag}` ({count})"))
+            .map(|(tag, count)| format!("`#{}` ({count})", shorten(tag, TAG_LEN)))
             .collect();
         out.push_str(&tags.join(" 　"));
         out.push('\n');
@@ -293,5 +302,21 @@ mod tests {
         let out = snippet(&long);
         assert_eq!(out.chars().count(), SNIPPET_LEN + 1, "省略記号のぶんだけ長い");
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn 長すぎるハッシュタグは切り詰める() {
+        let highlights = Highlights {
+            top_tweet: None,
+            hashtags: vec![
+                ("AIのクソ動画が話題になってるので人間が作った動画を見よう".into(), 2),
+                ("VALORANT".into(), 1),
+            ],
+        };
+        let text = format_report(&sample(), Period::Week, None, &highlights);
+
+        assert!(text.contains("`#AIのクソ動画が話題になってるの…` (2)"));
+        // 短いタグはそのまま
+        assert!(text.contains("`#VALORANT` (1)"));
     }
 }
