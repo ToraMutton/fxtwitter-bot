@@ -1,1 +1,4 @@
 /target
+
+# Claude Code のローカル設定（環境ごとに異なるため共有しない）
+.claude/settings.local.json
