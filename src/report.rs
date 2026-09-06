@@ -3,6 +3,7 @@
 //! ここも Discord に依存しない純粋な文字列処理なのでテストできる。
 
 use crate::enrich::TweetInfo;
+use crate::schedule::Span;
 use crate::tally::Tally;
 
 const MEDALS: [&str; 3] = ["🥇", "🥈", "🥉"];
@@ -21,36 +22,6 @@ pub struct Highlights {
     pub top_tweet: Option<TweetInfo>,
     /// ハッシュタグの出現数（多い順）
     pub hashtags: Vec<(String, usize)>,
-}
-
-/// 集計対象の期間。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Period {
-    /// 直近7日間
-    Week,
-    /// 直近30日間
-    Month,
-    /// 全期間
-    All,
-}
-
-impl Period {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Period::Week => "直近7日間",
-            Period::Month => "直近30日間",
-            Period::All => "全期間",
-        }
-    }
-
-    /// 前の期間と比べる表現。全期間には比較対象がない。
-    pub fn comparison_label(&self) -> Option<&'static str> {
-        match self {
-            Period::Week => Some("前週比"),
-            Period::Month => Some("前月比"),
-            Period::All => None,
-        }
-    }
 }
 
 /// 指定した文字数を超えたら省略記号を付けて切り詰める。
@@ -97,15 +68,15 @@ fn diff_text(current: usize, previous: usize) -> String {
 /// 集計結果を投稿用の本文にする。
 pub fn format_report(
     tally: &Tally,
-    period: Period,
+    span: &Span,
     previous_total: Option<usize>,
     highlights: &Highlights,
 ) -> String {
     if tally.total_tweets == 0 {
-        return format!("**{}** の投稿はありませんでした。", period.label());
+        return format!("**{}** の投稿はありませんでした。", span.label);
     }
 
-    let mut out = format!("# 🏆 {} のランキング\n\n", period.label());
+    let mut out = format!("# 🏆 {} のランキング\n\n", span.label);
 
     // ── 全体統計 ──
     out.push_str("## 📊 全体\n");
@@ -113,7 +84,7 @@ pub fn format_report(
         "投稿 **{}件** ／ 参加 **{}人**",
         tally.total_tweets, tally.participants
     ));
-    if let (Some(prev), Some(label)) = (previous_total, period.comparison_label()) {
+    if let (Some(prev), Some(label)) = (previous_total, span.comparison) {
         out.push_str(&format!(
             " ／ {} **{}件**",
             label,
@@ -183,6 +154,7 @@ fn format_count(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schedule::{all_time, rolling};
     use crate::tally::{tally, SharedPost, TweetRef};
 
     fn post(author: &str, account: &str, id: u64) -> SharedPost {
@@ -209,16 +181,22 @@ mod tests {
         Highlights::default()
     }
 
+    const NOW: i64 = 1_800_000_000;
+
+    fn week() -> Span {
+        rolling(NOW, 7, "直近7日間", "前週比")
+    }
+
     #[test]
     fn 投稿がなければその旨を返す() {
         let t = tally(&[]);
-        let text = format_report(&t, Period::Week, None, &none());
+        let text = format_report(&t, &week(), None, &none());
         assert!(text.contains("投稿はありませんでした"));
     }
 
     #[test]
     fn 主要な項目が含まれる() {
-        let text = format_report(&sample(), Period::Week, None, &none());
+        let text = format_report(&sample(), &week(), None, &none());
 
         assert!(text.contains("投稿 **3件**"));
         assert!(text.contains("参加 **2人**"));
@@ -229,26 +207,26 @@ mod tests {
 
     #[test]
     fn 前期比が表示される() {
-        let text = format_report(&sample(), Period::Week, Some(1), &none());
+        let text = format_report(&sample(), &week(), Some(1), &none());
         assert!(text.contains("前週比 **+2件**"));
 
-        let text = format_report(&sample(), Period::Week, Some(3), &none());
+        let text = format_report(&sample(), &week(), Some(3), &none());
         assert!(text.contains("前週比 **±0件**"));
 
-        let text = format_report(&sample(), Period::Week, Some(10), &none());
+        let text = format_report(&sample(), &week(), Some(10), &none());
         assert!(text.contains("前週比 **-7件**"));
     }
 
     #[test]
     fn 全期間では前期比を出さない() {
-        let text = format_report(&sample(), Period::All, Some(1), &none());
+        let text = format_report(&sample(), &all_time(NOW), Some(1), &none());
         assert!(!text.contains("比"));
     }
 
     #[test]
     fn 表示名の装飾文字を無効化する() {
         let t = tally(&[post("**ボス**", "acc", 1)]);
-        let text = format_report(&t, Period::Week, None, &none());
+        let text = format_report(&t, &week(), None, &none());
         // そのまま出ると太字として解釈されてしまう
         assert!(text.contains("\\*\\*ボス\\*\\*"));
     }
@@ -256,13 +234,13 @@ mod tests {
     #[test]
     fn メンションが飛ばないようにする() {
         let t = tally(&[post("@everyone", "acc", 1)]);
-        let text = format_report(&t, Period::Week, None, &none());
+        let text = format_report(&t, &week(), None, &none());
         assert!(!text.contains("@everyone"));
     }
 
     #[test]
     fn api情報がなければ該当の節を省く() {
-        let text = format_report(&sample(), Period::Week, None, &none());
+        let text = format_report(&sample(), &week(), None, &none());
         assert!(!text.contains("最強ツイート"));
         assert!(!text.contains("ハッシュタグ"));
     }
@@ -279,7 +257,7 @@ mod tests {
             }),
             hashtags: vec![("猫".into(), 3), ("犬".into(), 1)],
         };
-        let text = format_report(&sample(), Period::Week, None, &highlights);
+        let text = format_report(&sample(), &week(), None, &highlights);
 
         assert!(text.contains("## 💥 最強ツイート"));
         assert!(text.contains("[`@cat_movie`](https://x.com/cat_movie/status/1) — ❤️ 1.2万"));
@@ -313,7 +291,7 @@ mod tests {
                 ("VALORANT".into(), 1),
             ],
         };
-        let text = format_report(&sample(), Period::Week, None, &highlights);
+        let text = format_report(&sample(), &week(), None, &highlights);
 
         assert!(text.contains("`#AIのクソ動画が話題になってるの…` (2)"));
         // 短いタグはそのまま

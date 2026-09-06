@@ -1,15 +1,19 @@
 mod enrich;
 mod history;
 mod report;
+mod schedule;
 mod tally;
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use regex::Regex;
 use serenity::async_trait;
 use serenity::builder::{
     CreateCommand, CreateCommandOption, CreateInteractionResponse,
-    CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage,
 };
 use serenity::http::Http;
 use serenity::model::application::{CommandOptionType, Interaction};
@@ -19,17 +23,29 @@ use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 
 use enrich::Enricher;
-use report::{format_report, Highlights, Period};
+use report::{format_report, Highlights};
+use schedule::Span;
 
 /// Discord のメッセージ1件に入れられる文字数の上限には少し余裕を持たせる。
 const MAX_CONTENT: usize = 1900;
 
-const DAY: i64 = 86_400;
+/// 定期投稿の時刻が来ていないか確認する間隔。
+const SCHEDULER_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Bot 全体で共有する状態。
+///
+/// 定期投稿は別のタスクとして動くため、`Arc` で共有できる形にしてある。
+struct Bot {
+    allowed_channels: HashSet<u64>,
+    enricher: Enricher,
+}
 
 struct Handler {
     twitter_re: Regex,
-    allowed_channels: HashSet<u64>,
-    enricher: Enricher,
+    bot: Arc<Bot>,
+    /// 定期投稿タスクを起動済みかどうか。
+    /// `ready` は再接続のたびに呼ばれるため、二重起動を防ぐ必要がある。
+    scheduler_started: AtomicBool,
 }
 
 #[async_trait]
@@ -41,7 +57,7 @@ impl EventHandler for Handler {
         }
 
         // 対象チャンネル以外は無視
-        if !self.allowed_channels.contains(&msg.channel_id.get()) {
+        if !self.bot.allowed_channels.contains(&msg.channel_id.get()) {
             return;
         }
 
@@ -76,7 +92,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        if !self.allowed_channels.contains(&command.channel_id.get()) {
+        if !self.bot.allowed_channels.contains(&command.channel_id.get()) {
             let message = CreateInteractionResponseMessage::new()
                 .content("このチャンネルは集計の対象外です。")
                 .ephemeral(true);
@@ -86,16 +102,14 @@ impl EventHandler for Handler {
             return;
         }
 
-        let period = command
+        let choice = command
             .data
             .options
             .first()
             .and_then(|o| o.value.as_str())
-            .map_or(Period::Week, |v| match v {
-                "month" => Period::Month,
-                "all" => Period::All,
-                _ => Period::Week,
-            });
+            .unwrap_or("week")
+            .to_string();
+        let span = manual_span(&choice, now_unix());
 
         // 履歴の取得に数秒かかることがあるので、先に「処理中」を返しておく。
         // これをしないと Discord 側が3秒で応答なしと判断してしまう。
@@ -104,7 +118,8 @@ impl EventHandler for Handler {
             return;
         }
 
-        let text = match build_report(&ctx.http, &self.enricher, command.channel_id, period).await {
+        let text = match build_report(&ctx.http, &self.bot.enricher, command.channel_id, &span).await
+        {
             Ok(text) => text,
             Err(e) => {
                 eprintln!("集計に失敗: {:?}", e);
@@ -124,7 +139,7 @@ impl EventHandler for Handler {
         // 対象チャンネルが属するサーバーにスラッシュコマンドを登録する。
         // サーバー単位の登録は即座に反映される（全体登録は反映に最大1時間かかる）。
         let mut registered = HashSet::new();
-        for channel_id in &self.allowed_channels {
+        for channel_id in &self.bot.allowed_channels {
             match ctx.http.get_channel(ChannelId::new(*channel_id)).await {
                 Ok(Channel::Guild(channel)) => {
                     if !registered.insert(channel.guild_id) {
@@ -143,7 +158,75 @@ impl EventHandler for Handler {
                 Err(e) => eprintln!("チャンネル {} を取得できません: {:?}", channel_id, e),
             }
         }
+
+        // 再接続のたびに ready が呼ばれるので、定期投稿タスクは一度だけ起動する
+        if !self.scheduler_started.swap(true, Ordering::SeqCst) {
+            let http = Arc::clone(&ctx.http);
+            let bot = Arc::clone(&self.bot);
+            tokio::spawn(async move { run_scheduler(http, bot).await });
+            println!("定期投稿を開始しました（毎週月曜9時・毎月1日9時 JST）");
+        }
     }
+}
+
+/// 定期投稿の時刻が来ていないか、一定間隔で確認し続ける。
+async fn run_scheduler(http: Arc<Http>, bot: Arc<Bot>) {
+    let mut ticker = tokio::time::interval(SCHEDULER_INTERVAL);
+
+    loop {
+        ticker.tick().await;
+
+        let now = now_unix();
+        let due = [schedule::due_weekly(now), schedule::due_monthly(now)];
+
+        for channel_id in &bot.allowed_channels {
+            for span in &due {
+                if let Err(e) = post_if_due(&http, &bot, ChannelId::new(*channel_id), span).await {
+                    eprintln!("定期投稿に失敗（チャンネル {}）: {:?}", channel_id, e);
+                }
+            }
+        }
+    }
+}
+
+/// まだ投稿していない期間であれば、ランキングを投稿する。
+///
+/// 投稿済みかどうかはチャンネルの履歴を見て判断する。プロセスの記憶に頼らないため、
+/// 再起動をまたいでも二重投稿しない。逆に Bot が停止していた場合は、
+/// 復帰後に遅れて投稿される。
+async fn post_if_due(
+    http: &Http,
+    bot: &Bot,
+    channel_id: ChannelId,
+    span: &Span,
+) -> Result<(), serenity::Error> {
+    let Some(key) = &span.key else {
+        return Ok(());
+    };
+
+    // 投稿されるとすれば期間の終了以降なので、そこまで遡れば十分
+    if history::contains_marker(http, channel_id, key, span.end).await? {
+        return Ok(());
+    }
+
+    let text = build_report(http, &bot.enricher, channel_id, span).await?;
+    let body = with_marker(&text, key);
+
+    channel_id
+        .send_message(http, CreateMessage::new().content(body))
+        .await?;
+    println!("定期ランキングを投稿しました: {} ({})", key, channel_id);
+
+    Ok(())
+}
+
+/// 本文の末尾に、重複判定用の識別子を小さな文字で添える。
+///
+/// 切り詰めで識別子が消えると二重投稿につながるため、切り詰めた後に付ける。
+fn with_marker(text: &str, key: &str) -> String {
+    let marker = format!("\n-# {key}");
+    let room = MAX_CONTENT.saturating_sub(marker.chars().count());
+    format!("{}{}", truncate(text, room), marker)
 }
 
 /// `/ranking` コマンドの定義。
@@ -168,12 +251,12 @@ fn now_unix() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// (集計期間の開始, 前期間の開始) を返す。全期間の場合はどちらも 0。
-fn period_bounds(period: Period, now: i64) -> (i64, i64) {
-    match period {
-        Period::Week => (now - 7 * DAY, now - 14 * DAY),
-        Period::Month => (now - 30 * DAY, now - 60 * DAY),
-        Period::All => (0, 0),
+/// `/ranking` の選択肢から集計期間を決める。
+fn manual_span(choice: &str, now: i64) -> Span {
+    match choice {
+        "month" => schedule::rolling(now, 30, "直近30日間", "前月比"),
+        "all" => schedule::all_time(now),
+        _ => schedule::rolling(now, 7, "直近7日間", "前週比"),
     }
 }
 
@@ -182,25 +265,28 @@ async fn build_report(
     http: &Http,
     enricher: &Enricher,
     channel_id: ChannelId,
-    period: Period,
+    span: &Span,
 ) -> Result<String, serenity::Error> {
-    let (start, previous_start) = period_bounds(period, now_unix());
+    // 前期比を出すため、ひとつ前の期間まで余分に遡る
+    let since = span.previous_start.unwrap_or(span.start);
+    let posts = history::collect_posts(http, channel_id, since).await?;
 
-    // 前期比を出すため、1期間分だけ余分に遡る
-    let posts = history::collect_posts(http, channel_id, previous_start).await?;
     let (mut current, previous): (Vec<_>, Vec<_>) =
-        posts.into_iter().partition(|p| p.timestamp >= start);
+        posts.into_iter().partition(|p| span.contains(p.timestamp));
 
-    let previous_total = match period {
-        Period::All => None,
-        _ => Some(previous.iter().map(|p| p.tweets.len()).sum()),
-    };
+    let previous_total = span.previous_start.map(|previous_start| {
+        previous
+            .iter()
+            .filter(|p| p.timestamp >= previous_start && p.timestamp < span.start)
+            .map(|p| p.tweets.len())
+            .sum()
+    });
 
     let highlights = enrich_posts(enricher, &mut current).await;
 
     Ok(format_report(
         &tally::tally(&current),
-        period,
+        span,
         previous_total,
         &highlights,
     ))
@@ -289,8 +375,11 @@ async fn main() {
 
     let handler = Handler {
         twitter_re: Regex::new(r"https?://(twitter\.com|x\.com)(/\S*)?").unwrap(),
-        allowed_channels,
-        enricher: Enricher::new().expect("HTTPクライアントの作成に失敗しました"),
+        bot: Arc::new(Bot {
+            allowed_channels,
+            enricher: Enricher::new().expect("HTTPクライアントの作成に失敗しました"),
+        }),
+        scheduler_started: AtomicBool::new(false),
     };
 
     let mut client = Client::builder(&token, intents)
@@ -337,19 +426,34 @@ mod tests {
     }
 
     #[test]
-    fn 期間の境界を計算できる() {
-        let now = 1_000_000_000;
+    fn コマンドの選択肢から期間を決められる() {
+        let now = 1_800_000_000;
 
-        let (start, prev) = period_bounds(Period::Week, now);
-        assert_eq!(now - start, 7 * DAY);
-        assert_eq!(start - prev, 7 * DAY, "前期間も同じ長さであること");
+        assert_eq!(manual_span("week", now).label, "直近7日間");
+        assert_eq!(manual_span("month", now).label, "直近30日間");
+        assert_eq!(manual_span("all", now).label, "全期間");
+        // 未知の値や未指定は既定の週にする
+        assert_eq!(manual_span("", now).label, "直近7日間");
 
-        let (start, prev) = period_bounds(Period::Month, now);
-        assert_eq!(now - start, 30 * DAY);
-        assert_eq!(start - prev, 30 * DAY);
+        // 手動実行は定期投稿の重複判定に混ざらない
+        assert!(manual_span("week", now).key.is_none());
+    }
 
-        // 全期間は遡る起点を持たない
-        assert_eq!(period_bounds(Period::All, now), (0, 0));
+    #[test]
+    fn 識別子を末尾に付ける() {
+        let out = with_marker("本文", "週次 2026-W36");
+        assert!(out.ends_with("\n-# 週次 2026-W36"));
+        assert!(out.starts_with("本文"));
+    }
+
+    #[test]
+    fn 本文が長くても識別子は残る() {
+        // 識別子が切り落とされると二重投稿の原因になる
+        let long = "あ".repeat(MAX_CONTENT * 2);
+        let out = with_marker(&long, "週次 2026-W36");
+
+        assert!(out.ends_with("週次 2026-W36"), "識別子が残っていること");
+        assert!(out.chars().count() <= MAX_CONTENT, "上限を超えないこと");
     }
 
     #[test]

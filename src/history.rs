@@ -68,3 +68,44 @@ pub async fn collect_posts(
 
     Ok(posts)
 }
+
+/// `since` 以降の履歴に、指定した識別子を含む Bot の投稿があるか調べる。
+///
+/// 定期ランキングを二重投稿しないための確認に使う。
+pub async fn contains_marker(
+    http: &Http,
+    channel_id: ChannelId,
+    marker: &str,
+    since: i64,
+) -> Result<bool, serenity::Error> {
+    let mut before = None;
+    let mut scanned = 0usize;
+
+    loop {
+        let mut request = GetMessages::new().limit(BATCH);
+        if let Some(id) = before {
+            request = request.before(id);
+        }
+
+        let batch = channel_id.messages(http, request).await?;
+        if batch.is_empty() {
+            return Ok(false);
+        }
+
+        for msg in &batch {
+            if msg.timestamp.unix_timestamp() < since {
+                return Ok(false);
+            }
+            if msg.author.bot && msg.content.contains(marker) {
+                return Ok(true);
+            }
+        }
+
+        scanned += batch.len();
+        before = batch.last().map(|m| m.id);
+
+        if batch.len() < BATCH as usize || scanned >= MAX_MESSAGES {
+            return Ok(false);
+        }
+    }
+}
