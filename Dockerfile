@@ -1,4 +1,5 @@
-FROM rust:latest AS builder
+# ビルド用。実行環境(debian:bookworm-slim)と同じ bookworm を明示して glibc を揃える
+FROM rust:1.98-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release

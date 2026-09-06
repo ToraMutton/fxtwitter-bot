@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use regex::Regex;
 use serenity::async_trait;
 use serenity::model::channel::Message;
@@ -6,6 +8,7 @@ use serenity::prelude::*;
 
 struct Handler {
     twitter_re: Regex,
+    allowed_channels: HashSet<u64>,
 }
 
 #[async_trait]
@@ -16,8 +19,8 @@ impl EventHandler for Handler {
             return;
         }
 
-        let allowed_channel: u64 = 1432361849826836600;
-        if msg.channel_id != allowed_channel {
+        // 対象チャンネル以外は無視
+        if !self.allowed_channels.contains(&msg.channel_id.get()) {
             return;
         }
 
@@ -49,14 +52,43 @@ impl EventHandler for Handler {
     }
 }
 
+/// カンマ区切りのチャンネルID文字列を解析する。
+/// 空白は無視し、空の要素は読み飛ばす。
+fn parse_channel_ids(raw: &str) -> Result<HashSet<u64>, String> {
+    let mut ids = HashSet::new();
+
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let id = part
+            .parse::<u64>()
+            .map_err(|_| format!("チャンネルIDとして解釈できません: {part}"))?;
+        ids.insert(id);
+    }
+
+    if ids.is_empty() {
+        return Err("チャンネルIDが1つも指定されていません".to_string());
+    }
+
+    Ok(ids)
+}
+
 #[tokio::main]
 async fn main() {
     let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKENが設定されていません");
+
+    let raw_channels =
+        std::env::var("ALLOWED_CHANNEL_IDS").expect("ALLOWED_CHANNEL_IDSが設定されていません");
+    let allowed_channels = parse_channel_ids(&raw_channels)
+        .unwrap_or_else(|e| panic!("ALLOWED_CHANNEL_IDSの解析に失敗しました: {e}"));
 
     let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
     let handler = Handler {
         twitter_re: Regex::new(r"https?://(twitter\.com|x\.com)(/\S*)?").unwrap(),
+        allowed_channels,
     };
 
     let mut client = Client::builder(&token, intents)
@@ -66,5 +98,39 @@ async fn main() {
 
     if let Err(e) = client.start().await {
         eprintln!("クライアントエラー: {:?}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 単一のidを解析できる() {
+        let ids = parse_channel_ids("123").unwrap();
+        assert_eq!(ids, HashSet::from([123]));
+    }
+
+    #[test]
+    fn カンマ区切りと空白を解析できる() {
+        let ids = parse_channel_ids(" 123 , 456,789 ").unwrap();
+        assert_eq!(ids, HashSet::from([123, 456, 789]));
+    }
+
+    #[test]
+    fn 末尾のカンマは無視される() {
+        let ids = parse_channel_ids("123,456,").unwrap();
+        assert_eq!(ids, HashSet::from([123, 456]));
+    }
+
+    #[test]
+    fn 数値以外はエラーになる() {
+        assert!(parse_channel_ids("123,abc").is_err());
+    }
+
+    #[test]
+    fn 空文字列はエラーになる() {
+        assert!(parse_channel_ids("").is_err());
+        assert!(parse_channel_ids("  ,  ").is_err());
     }
 }
