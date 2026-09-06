@@ -49,6 +49,17 @@ pub struct Tally {
     pub top_reacted: Vec<SharedPost>,
 }
 
+/// X の URL には `https://x.com/i/status/123` のようにユーザー名を含まない形式がある。
+/// これらの予約パスはアカウント名として扱わない。
+const RESERVED_PATHS: [&str; 4] = ["i", "web", "intent", "home"];
+
+/// URL から取り出した文字列が、実在しうるアカウント名かどうか。
+pub fn is_account_name(candidate: &str) -> bool {
+    !RESERVED_PATHS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(candidate))
+}
+
 fn tweet_url_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -120,7 +131,10 @@ pub fn tally(posts: &[SharedPost]) -> Tally {
     for post in posts {
         *author_counts.entry(post.author.clone()).or_default() += post.tweets.len();
         for tweet in &post.tweets {
-            *account_counts.entry(tweet.account.clone()).or_default() += 1;
+            // ユーザー名を含まない形式のURLは、元アカウントを特定できないため数えない
+            if is_account_name(&tweet.account) {
+                *account_counts.entry(tweet.account.clone()).or_default() += 1;
+            }
         }
     }
 
@@ -247,6 +261,30 @@ mod tests {
             t.by_account,
             vec![("cat".into(), 2), ("bird".into(), 1), ("dog".into(), 1)]
         );
+    }
+
+    #[test]
+    fn ユーザー名を含まないurlはアカウントとして数えない() {
+        // https://x.com/i/status/123 のような形式
+        let posts = vec![
+            post("A", &["i"], 0, 100),
+            post("B", &["web"], 0, 200),
+            post("C", &["cat"], 0, 300),
+        ];
+        let t = tally(&posts);
+
+        // 投稿数としては3件すべて数える
+        assert_eq!(t.total_tweets, 3);
+        // アカウントランキングには実在しうる名前だけ載る
+        assert_eq!(t.by_account, vec![("cat".into(), 1)]);
+    }
+
+    #[test]
+    fn 予約パスの判定は大文字小文字を区別しない() {
+        assert!(!is_account_name("i"));
+        assert!(!is_account_name("I"));
+        assert!(is_account_name("ice"));
+        assert!(is_account_name("cat_movie"));
     }
 
     #[test]
