@@ -24,8 +24,6 @@ pub struct SharedPost {
     pub author: String,
     /// そのメッセージに含まれていたツイート
     pub tweets: Vec<TweetRef>,
-    /// メッセージに付いたリアクションの合計数
-    pub reactions: u64,
     /// 投稿時刻（UNIX秒）
     pub timestamp: i64,
     /// メッセージID（リンク生成用）
@@ -45,8 +43,6 @@ pub struct Tally {
     pub by_author: Vec<(String, usize)>,
     /// 元アカウントのランキング（多い順）
     pub by_account: Vec<(String, usize)>,
-    /// リアクション数の多い投稿（多い順、リアクション0のものは含まない）
-    pub top_reacted: Vec<SharedPost>,
 }
 
 /// X の URL には `https://x.com/i/status/123` のようにユーザー名を含まない形式がある。
@@ -138,30 +134,56 @@ pub fn tally(posts: &[SharedPost]) -> Tally {
         }
     }
 
-    let mut top_reacted: Vec<SharedPost> =
-        posts.iter().filter(|p| p.reactions > 0).cloned().collect();
-    // リアクションが多い順。同数なら新しい投稿を先に。
-    top_reacted.sort_by(|a, b| {
-        b.reactions
-            .cmp(&a.reactions)
-            .then_with(|| b.timestamp.cmp(&a.timestamp))
-    });
-
     Tally {
         total_tweets: posts.iter().map(|p| p.tweets.len()).sum(),
         total_messages: posts.len(),
         participants: author_counts.len(),
         by_author: ranked(author_counts),
         by_account: ranked(account_counts),
-        top_reacted,
     }
+}
+
+/// API から判明した本当の投稿者名で、URL 由来のアカウント名を上書きする。
+///
+/// `https://x.com/i/status/123` のようにURLへ名前が含まれない投稿でも、
+/// これにより正しいアカウントとして集計できるようになる。
+pub fn apply_screen_names(posts: &mut [SharedPost], screen_names: &HashMap<String, String>) {
+    for post in posts.iter_mut() {
+        for tweet in post.tweets.iter_mut() {
+            if let Some(name) = screen_names.get(&tweet.id) {
+                tweet.account = name.clone();
+            }
+        }
+    }
+}
+
+/// 本文からハッシュタグを数える。多い順に返す。
+pub fn count_hashtags(texts: &[&str]) -> Vec<(String, usize)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"[#＃]([\p{L}\p{N}_]+)").expect("ハッシュタグの正規表現が不正")
+    });
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for text in texts {
+        // 同じ投稿内で同じタグが繰り返されても1回として数える
+        let mut seen = std::collections::HashSet::new();
+        for capture in re.captures_iter(text) {
+            let tag = capture[1].to_string();
+            if seen.insert(tag.clone()) {
+                *counts.entry(tag).or_default() += 1;
+            }
+        }
+    }
+
+    ranked(counts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn post(author: &str, accounts: &[&str], reactions: u64, timestamp: i64) -> SharedPost {
+    fn post(author: &str, accounts: &[&str], timestamp: i64) -> SharedPost {
         SharedPost {
             author: author.to_string(),
             tweets: accounts
@@ -172,7 +194,6 @@ mod tests {
                     id: format!("{timestamp}{i}"),
                 })
                 .collect(),
-            reactions,
             timestamp,
             message_id: timestamp as u64,
         }
@@ -247,9 +268,9 @@ mod tests {
     #[test]
     fn 投稿数を集計できる() {
         let posts = vec![
-            post("A", &["cat"], 0, 100),
-            post("A", &["dog"], 0, 200),
-            post("B", &["cat", "bird"], 0, 300),
+            post("A", &["cat"], 100),
+            post("A", &["dog"], 200),
+            post("B", &["cat", "bird"], 300),
         ];
         let t = tally(&posts);
 
@@ -267,9 +288,9 @@ mod tests {
     fn ユーザー名を含まないurlはアカウントとして数えない() {
         // https://x.com/i/status/123 のような形式
         let posts = vec![
-            post("A", &["i"], 0, 100),
-            post("B", &["web"], 0, 200),
-            post("C", &["cat"], 0, 300),
+            post("A", &["i"], 100),
+            post("B", &["web"], 200),
+            post("C", &["cat"], 300),
         ];
         let t = tally(&posts);
 
@@ -288,18 +309,41 @@ mod tests {
     }
 
     #[test]
-    fn リアクション順に並ぶ() {
-        let posts = vec![
-            post("A", &["x"], 1, 100),
-            post("B", &["y"], 5, 200),
-            post("C", &["z"], 0, 300),
-        ];
-        let t = tally(&posts);
+    fn apiで判明した投稿者名で上書きできる() {
+        let mut posts = vec![post("A", &["i"], 100), post("B", &["known"], 200)];
+        let names = HashMap::from([("1000".to_string(), "本当の名前".to_string())]);
 
-        // リアクション0の投稿は除外される
-        assert_eq!(t.top_reacted.len(), 2);
-        assert_eq!(t.top_reacted[0].author, "B");
-        assert_eq!(t.top_reacted[1].author, "A");
+        apply_screen_names(&mut posts, &names);
+
+        // ID "1000" のツイートだけ上書きされる
+        assert_eq!(posts[0].tweets[0].account, "本当の名前");
+        assert_eq!(posts[1].tweets[0].account, "known");
+
+        // 上書き後は集計にも載る
+        let t = tally(&posts);
+        assert_eq!(
+            t.by_account,
+            vec![("known".into(), 1), ("本当の名前".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn ハッシュタグを数えられる() {
+        let tags = count_hashtags(&["#猫 かわいい #猫", "#猫 と #犬", "＃全角 も拾う"]);
+        assert_eq!(
+            tags,
+            vec![
+                ("猫".into(), 2),
+                ("全角".into(), 1),
+                ("犬".into(), 1),
+            ],
+            "同一投稿内の重複は1回として数える"
+        );
+    }
+
+    #[test]
+    fn ハッシュタグがなければ空() {
+        assert!(count_hashtags(&["ただの文章です", "記号 # だけ"]).is_empty());
     }
 
     #[test]
@@ -308,6 +352,6 @@ mod tests {
         assert_eq!(t.total_tweets, 0);
         assert_eq!(t.participants, 0);
         assert!(t.by_author.is_empty());
-        assert!(t.top_reacted.is_empty());
+        assert!(t.by_account.is_empty());
     }
 }

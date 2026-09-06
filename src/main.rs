@@ -1,3 +1,4 @@
+mod enrich;
 mod history;
 mod report;
 mod tally;
@@ -17,7 +18,8 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::ChannelId;
 use serenity::prelude::*;
 
-use report::{format_report, Period};
+use enrich::Enricher;
+use report::{format_report, Highlights, Period};
 
 /// Discord のメッセージ1件に入れられる文字数の上限には少し余裕を持たせる。
 const MAX_CONTENT: usize = 1900;
@@ -27,6 +29,7 @@ const DAY: i64 = 86_400;
 struct Handler {
     twitter_re: Regex,
     allowed_channels: HashSet<u64>,
+    enricher: Enricher,
 }
 
 #[async_trait]
@@ -101,8 +104,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let guild_id = command.guild_id.map_or(0, |g| g.get());
-        let text = match build_report(&ctx.http, command.channel_id, guild_id, period).await {
+        let text = match build_report(&ctx.http, &self.enricher, command.channel_id, period).await {
             Ok(text) => text,
             Err(e) => {
                 eprintln!("集計に失敗: {:?}", e);
@@ -178,15 +180,15 @@ fn period_bounds(period: Period, now: i64) -> (i64, i64) {
 /// 履歴を集計して投稿用の本文を作る。
 async fn build_report(
     http: &Http,
+    enricher: &Enricher,
     channel_id: ChannelId,
-    guild_id: u64,
     period: Period,
 ) -> Result<String, serenity::Error> {
     let (start, previous_start) = period_bounds(period, now_unix());
 
     // 前期比を出すため、1期間分だけ余分に遡る
     let posts = history::collect_posts(http, channel_id, previous_start).await?;
-    let (current, previous): (Vec<_>, Vec<_>) =
+    let (mut current, previous): (Vec<_>, Vec<_>) =
         posts.into_iter().partition(|p| p.timestamp >= start);
 
     let previous_total = match period {
@@ -194,13 +196,51 @@ async fn build_report(
         _ => Some(previous.iter().map(|p| p.tweets.len()).sum()),
     };
 
+    let highlights = enrich_posts(enricher, &mut current).await;
+
     Ok(format_report(
         &tally::tally(&current),
         period,
-        guild_id,
-        channel_id.get(),
         previous_total,
+        &highlights,
     ))
+}
+
+/// FxTwitter API で元ツイートの情報を補い、載せられる話題を組み立てる。
+///
+/// API が使えなくても集計そのものは成立するため、失敗しても空の結果を返す。
+async fn enrich_posts(enricher: &Enricher, posts: &mut [tally::SharedPost]) -> Highlights {
+    // 新しい投稿から順に問い合わせたいので、新しい順に並べてIDを集める
+    let mut ordered: Vec<&tally::SharedPost> = posts.iter().collect();
+    ordered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    let ids: Vec<String> = ordered
+        .iter()
+        .flat_map(|p| p.tweets.iter().map(|t| t.id.clone()))
+        .collect();
+
+    if ids.is_empty() {
+        return Highlights::default();
+    }
+
+    let fetched = enricher.fetch_many(&ids).await;
+    if fetched.is_empty() {
+        return Highlights::default();
+    }
+
+    // URL に名前が入っていない投稿も、ここで正しいアカウント名になる
+    let screen_names = fetched
+        .iter()
+        .map(|(id, info)| (id.clone(), info.screen_name.clone()))
+        .collect();
+    tally::apply_screen_names(posts, &screen_names);
+
+    let top_tweet = fetched.values().max_by_key(|info| info.likes).cloned();
+    let texts: Vec<&str> = fetched.values().map(|info| info.text.as_str()).collect();
+
+    Highlights {
+        top_tweet,
+        hashtags: tally::count_hashtags(&texts),
+    }
 }
 
 /// 文字数の上限で切り詰める。文字の途中で切らないようにする。
@@ -250,6 +290,7 @@ async fn main() {
     let handler = Handler {
         twitter_re: Regex::new(r"https?://(twitter\.com|x\.com)(/\S*)?").unwrap(),
         allowed_channels,
+        enricher: Enricher::new().expect("HTTPクライアントの作成に失敗しました"),
     };
 
     let mut client = Client::builder(&token, intents)

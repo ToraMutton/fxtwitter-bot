@@ -52,7 +52,6 @@ pub async fn collect_posts(
                 posts.push(SharedPost {
                     author,
                     tweets,
-                    reactions: msg.reactions.iter().map(|r| r.count).sum(),
                     timestamp,
                     message_id: msg.id.get(),
                 });

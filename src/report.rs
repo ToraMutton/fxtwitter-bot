@@ -2,9 +2,22 @@
 //!
 //! ここも Discord に依存しない純粋な文字列処理なのでテストできる。
 
+use crate::enrich::TweetInfo;
 use crate::tally::Tally;
 
 const MEDALS: [&str; 3] = ["🥇", "🥈", "🥉"];
+
+/// ツイート本文を1行で見せるときの長さ
+const SNIPPET_LEN: usize = 80;
+
+/// FxTwitter API から得られた「あれば載せる」情報。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Highlights {
+    /// いいね数が最も多かったツイート
+    pub top_tweet: Option<TweetInfo>,
+    /// ハッシュタグの出現数（多い順）
+    pub hashtags: Vec<(String, usize)>,
+}
 
 /// 集計対象の期間。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,9 +49,15 @@ impl Period {
     }
 }
 
-/// Discord のメッセージへ飛ぶリンクを組み立てる。
-fn message_link(guild_id: u64, channel_id: u64, message_id: u64) -> String {
-    format!("https://discord.com/channels/{guild_id}/{channel_id}/{message_id}")
+/// ツイート本文を1行に収まる長さへ整える。
+fn snippet(text: &str) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= SNIPPET_LEN {
+        return single_line;
+    }
+    let mut out: String = single_line.chars().take(SNIPPET_LEN).collect();
+    out.push('…');
+    out
 }
 
 /// Discord のメンションや装飾として解釈されうる文字を無効化する。
@@ -70,9 +89,8 @@ fn diff_text(current: usize, previous: usize) -> String {
 pub fn format_report(
     tally: &Tally,
     period: Period,
-    guild_id: u64,
-    channel_id: u64,
     previous_total: Option<usize>,
+    highlights: &Highlights,
 ) -> String {
     if tally.total_tweets == 0 {
         return format!("**{}** の投稿はありませんでした。", period.label());
@@ -107,17 +125,18 @@ pub fn format_report(
     }
     out.push('\n');
 
-    // ── リアクションランキング ──
-    if !tally.top_reacted.is_empty() {
-        out.push_str("## 🔥 リアクションが多かった投稿\n");
-        for (i, post) in tally.top_reacted.iter().take(3).enumerate() {
-            out.push_str(&format!(
-                "{} [{}]({}) — {} 個\n",
-                MEDALS[i],
-                escape(&post.author),
-                message_link(guild_id, channel_id, post.message_id),
-                post.reactions
-            ));
+    // ── 最強ツイート ──
+    if let Some(tweet) = &highlights.top_tweet {
+        out.push_str("## 💥 最強ツイート\n");
+        out.push_str(&format!(
+            "[`@{}`]({}) — ❤️ {}\n",
+            tweet.screen_name,
+            tweet.url,
+            format_count(tweet.likes)
+        ));
+        let text = snippet(&tweet.text);
+        if !text.is_empty() {
+            out.push_str(&format!("> {}\n", escape(&text)));
         }
         out.push('\n');
     }
@@ -128,7 +147,28 @@ pub fn format_report(
         out.push_str(&format!("- `@{account}` — {count}件\n"));
     }
 
+    // ── ハッシュタグ ──
+    if !highlights.hashtags.is_empty() {
+        out.push_str("\n## 🔤 よく出たハッシュタグ\n");
+        let tags: Vec<String> = highlights
+            .hashtags
+            .iter()
+            .take(5)
+            .map(|(tag, count)| format!("`#{tag}` ({count})"))
+            .collect();
+        out.push_str(&tags.join(" 　"));
+        out.push('\n');
+    }
+
     out
+}
+
+/// いいね数を読みやすくする（12345 → 1.2万）。
+fn format_count(count: u64) -> String {
+    if count < 10_000 {
+        return count.to_string();
+    }
+    format!("{:.1}万", count as f64 / 10_000.0)
 }
 
 #[cfg(test)]
@@ -136,14 +176,13 @@ mod tests {
     use super::*;
     use crate::tally::{tally, SharedPost, TweetRef};
 
-    fn post(author: &str, account: &str, reactions: u64, id: u64) -> SharedPost {
+    fn post(author: &str, account: &str, id: u64) -> SharedPost {
         SharedPost {
             author: author.to_string(),
             tweets: vec![TweetRef {
                 account: account.to_string(),
                 id: id.to_string(),
             }],
-            reactions,
             timestamp: id as i64,
             message_id: id,
         }
@@ -151,69 +190,108 @@ mod tests {
 
     fn sample() -> Tally {
         tally(&[
-            post("あきら", "cat_movie", 3, 1),
-            post("あきら", "cat_movie", 0, 2),
-            post("ばなな", "dog_clip", 7, 3),
+            post("あきら", "cat_movie", 1),
+            post("あきら", "cat_movie", 2),
+            post("ばなな", "dog_clip", 3),
         ])
+    }
+
+    fn none() -> Highlights {
+        Highlights::default()
     }
 
     #[test]
     fn 投稿がなければその旨を返す() {
         let t = tally(&[]);
-        let text = format_report(&t, Period::Week, 1, 2, None);
+        let text = format_report(&t, Period::Week, None, &none());
         assert!(text.contains("投稿はありませんでした"));
     }
 
     #[test]
     fn 主要な項目が含まれる() {
-        let text = format_report(&sample(), Period::Week, 111, 222, None);
+        let text = format_report(&sample(), Period::Week, None, &none());
 
         assert!(text.contains("投稿 **3件**"));
         assert!(text.contains("参加 **2人**"));
         assert!(text.contains("🥇 あきら — 2件"));
         assert!(text.contains("🥈 ばなな — 1件"));
         assert!(text.contains("`@cat_movie` — 2件"));
-        // リアクション最多が先頭に来る
-        assert!(text.contains("🥇 [ばなな](https://discord.com/channels/111/222/3) — 7 個"));
     }
 
     #[test]
     fn 前期比が表示される() {
-        let text = format_report(&sample(), Period::Week, 1, 2, Some(1));
+        let text = format_report(&sample(), Period::Week, Some(1), &none());
         assert!(text.contains("前週比 **+2件**"));
 
-        let text = format_report(&sample(), Period::Week, 1, 2, Some(3));
+        let text = format_report(&sample(), Period::Week, Some(3), &none());
         assert!(text.contains("前週比 **±0件**"));
 
-        let text = format_report(&sample(), Period::Week, 1, 2, Some(10));
+        let text = format_report(&sample(), Period::Week, Some(10), &none());
         assert!(text.contains("前週比 **-7件**"));
     }
 
     #[test]
     fn 全期間では前期比を出さない() {
-        let text = format_report(&sample(), Period::All, 1, 2, Some(1));
+        let text = format_report(&sample(), Period::All, Some(1), &none());
         assert!(!text.contains("比"));
     }
 
     #[test]
     fn 表示名の装飾文字を無効化する() {
-        let t = tally(&[post("**ボス**", "acc", 0, 1)]);
-        let text = format_report(&t, Period::Week, 1, 2, None);
+        let t = tally(&[post("**ボス**", "acc", 1)]);
+        let text = format_report(&t, Period::Week, None, &none());
         // そのまま出ると太字として解釈されてしまう
         assert!(text.contains("\\*\\*ボス\\*\\*"));
     }
 
     #[test]
     fn メンションが飛ばないようにする() {
-        let t = tally(&[post("@everyone", "acc", 0, 1)]);
-        let text = format_report(&t, Period::Week, 1, 2, None);
+        let t = tally(&[post("@everyone", "acc", 1)]);
+        let text = format_report(&t, Period::Week, None, &none());
         assert!(!text.contains("@everyone"));
     }
 
     #[test]
-    fn リアクションがなければその節を省く() {
-        let t = tally(&[post("だれか", "acc", 0, 1)]);
-        let text = format_report(&t, Period::Week, 1, 2, None);
-        assert!(!text.contains("リアクション"));
+    fn api情報がなければ該当の節を省く() {
+        let text = format_report(&sample(), Period::Week, None, &none());
+        assert!(!text.contains("最強ツイート"));
+        assert!(!text.contains("ハッシュタグ"));
+    }
+
+    #[test]
+    fn 最強ツイートとハッシュタグを表示する() {
+        let highlights = Highlights {
+            top_tweet: Some(TweetInfo {
+                id: "1".into(),
+                screen_name: "cat_movie".into(),
+                text: "かわいい猫\nです".into(),
+                likes: 12345,
+                url: "https://x.com/cat_movie/status/1".into(),
+            }),
+            hashtags: vec![("猫".into(), 3), ("犬".into(), 1)],
+        };
+        let text = format_report(&sample(), Period::Week, None, &highlights);
+
+        assert!(text.contains("## 💥 最強ツイート"));
+        assert!(text.contains("[`@cat_movie`](https://x.com/cat_movie/status/1) — ❤️ 1.2万"));
+        // 本文の改行は1行にまとめる
+        assert!(text.contains("> かわいい猫 です"));
+        assert!(text.contains("`#猫` (3)"));
+    }
+
+    #[test]
+    fn いいね数を読みやすくする() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(9999), "9999");
+        assert_eq!(format_count(10_000), "1.0万");
+        assert_eq!(format_count(123_456), "12.3万");
+    }
+
+    #[test]
+    fn 長い本文は切り詰める() {
+        let long = "あ".repeat(200);
+        let out = snippet(&long);
+        assert_eq!(out.chars().count(), SNIPPET_LEN + 1, "省略記号のぶんだけ長い");
+        assert!(out.ends_with('…'));
     }
 }
