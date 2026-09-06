@@ -15,13 +15,15 @@ const SNIPPET_LEN: usize = 80;
 /// Twitter のハッシュタグは文章のように長いものがあり、そのまま並べると崩れる。
 const TAG_LEN: usize = 16;
 
-/// FxTwitter API から得られた「あれば載せる」情報。
+/// 「あれば載せる」情報。取得できなくてもランキング本体は成立する。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Highlights {
     /// いいね数が最も多かったツイート
     pub top_tweet: Option<TweetInfo>,
     /// ハッシュタグの出現数（多い順）
     pub hashtags: Vec<(String, usize)>,
+    /// AI による総括
+    pub summary: Option<String>,
 }
 
 /// 指定した文字数を超えたら省略記号を付けて切り詰める。
@@ -77,6 +79,15 @@ pub fn format_report(
     }
 
     let mut out = format!("# 🏆 {} のランキング\n\n", span.label);
+
+    // ── AIによる総括 ──
+    if let Some(summary) = &highlights.summary {
+        // 生成された文章をそのまま引用として載せる
+        for line in summary.lines().filter(|l| !l.trim().is_empty()) {
+            out.push_str(&format!("> {}\n", escape(line)));
+        }
+        out.push('\n');
+    }
 
     // ── 全体統計 ──
     out.push_str("## 📊 全体\n");
@@ -256,6 +267,7 @@ mod tests {
                 url: "https://x.com/cat_movie/status/1".into(),
             }),
             hashtags: vec![("猫".into(), 3), ("犬".into(), 1)],
+            summary: None,
         };
         let text = format_report(&sample(), &week(), None, &highlights);
 
@@ -264,6 +276,41 @@ mod tests {
         // 本文の改行は1行にまとめる
         assert!(text.contains("> かわいい猫 です"));
         assert!(text.contains("`#猫` (3)"));
+    }
+
+    #[test]
+    fn ai総括を先頭に載せる() {
+        let highlights = Highlights {
+            summary: Some("今週は猫だらけでした。\n平和ですね。".into()),
+            ..Highlights::default()
+        };
+        let text = format_report(&sample(), &week(), None, &highlights);
+
+        assert!(text.contains("> 今週は猫だらけでした。"));
+        assert!(text.contains("> 平和ですね。"));
+        // 見出しの直後、統計より前に出る
+        let summary_at = text.find("今週は猫だらけ").unwrap();
+        let stats_at = text.find("## 📊 全体").unwrap();
+        assert!(summary_at < stats_at);
+    }
+
+    #[test]
+    fn ai総括がなければ何も出さない() {
+        let text = format_report(&sample(), &week(), None, &none());
+        assert!(!text.contains('>'));
+    }
+
+    #[test]
+    fn ai総括の装飾文字も無効化する() {
+        // 生成された文章がそのまま Discord の記法として解釈されないようにする
+        let highlights = Highlights {
+            summary: Some("**強調**と@everyone".into()),
+            ..Highlights::default()
+        };
+        let text = format_report(&sample(), &week(), None, &highlights);
+
+        assert!(text.contains("\\*\\*強調\\*\\*"));
+        assert!(!text.contains("@everyone"));
     }
 
     #[test]
@@ -290,6 +337,7 @@ mod tests {
                 ("AIのクソ動画が話題になってるので人間が作った動画を見よう".into(), 2),
                 ("VALORANT".into(), 1),
             ],
+            summary: None,
         };
         let text = format_report(&sample(), &week(), None, &highlights);
 

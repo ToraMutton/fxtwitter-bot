@@ -2,6 +2,7 @@ mod enrich;
 mod history;
 mod report;
 mod schedule;
+mod summarize;
 mod tally;
 
 use std::collections::HashSet;
@@ -25,6 +26,7 @@ use serenity::prelude::*;
 use enrich::Enricher;
 use report::{format_report, Highlights};
 use schedule::Span;
+use summarize::Summarizer;
 
 /// Discord のメッセージ1件に入れられる文字数の上限には少し余裕を持たせる。
 const MAX_CONTENT: usize = 1900;
@@ -38,6 +40,8 @@ const SCHEDULER_INTERVAL: Duration = Duration::from_secs(5 * 60);
 struct Bot {
     allowed_channels: HashSet<u64>,
     enricher: Enricher,
+    /// AI総括。APIキーが未設定なら `None` で、機能ごと無効になる。
+    summarizer: Option<Summarizer>,
 }
 
 struct Handler {
@@ -118,7 +122,15 @@ impl EventHandler for Handler {
             return;
         }
 
-        let text = match build_report(&ctx.http, &self.bot.enricher, command.channel_id, &span).await
+        // AI総括は定期投稿のみ。手動実行では課金が読めないため付けない。
+        let text = match build_report(
+            &ctx.http,
+            &self.bot.enricher,
+            None,
+            command.channel_id,
+            &span,
+        )
+        .await
         {
             Ok(text) => text,
             Err(e) => {
@@ -209,7 +221,14 @@ async fn post_if_due(
         return Ok(());
     }
 
-    let text = build_report(http, &bot.enricher, channel_id, span).await?;
+    let text = build_report(
+        http,
+        &bot.enricher,
+        bot.summarizer.as_ref(),
+        channel_id,
+        span,
+    )
+    .await?;
     let body = with_marker(&text, key);
 
     channel_id
@@ -264,6 +283,7 @@ fn manual_span(choice: &str, now: i64) -> Span {
 async fn build_report(
     http: &Http,
     enricher: &Enricher,
+    summarizer: Option<&Summarizer>,
     channel_id: ChannelId,
     span: &Span,
 ) -> Result<String, serenity::Error> {
@@ -282,7 +302,13 @@ async fn build_report(
             .sum()
     });
 
-    let highlights = enrich_posts(enricher, &mut current).await;
+    let (mut highlights, texts) = enrich_posts(enricher, &mut current).await;
+
+    // 生成に失敗しても None が入るだけで、ランキング本体には影響しない
+    if let Some(summarizer) = summarizer {
+        let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+        highlights.summary = summarizer.summarize(&borrowed).await;
+    }
 
     Ok(format_report(
         &tally::tally(&current),
@@ -295,7 +321,11 @@ async fn build_report(
 /// FxTwitter API で元ツイートの情報を補い、載せられる話題を組み立てる。
 ///
 /// API が使えなくても集計そのものは成立するため、失敗しても空の結果を返す。
-async fn enrich_posts(enricher: &Enricher, posts: &mut [tally::SharedPost]) -> Highlights {
+/// 併せて、AI総括に渡すためのツイート本文を返す。
+async fn enrich_posts(
+    enricher: &Enricher,
+    posts: &mut [tally::SharedPost],
+) -> (Highlights, Vec<String>) {
     // 新しい投稿から順に問い合わせたいので、新しい順に並べてIDを集める
     let mut ordered: Vec<&tally::SharedPost> = posts.iter().collect();
     ordered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -305,12 +335,12 @@ async fn enrich_posts(enricher: &Enricher, posts: &mut [tally::SharedPost]) -> H
         .collect();
 
     if ids.is_empty() {
-        return Highlights::default();
+        return (Highlights::default(), Vec::new());
     }
 
     let fetched = enricher.fetch_many(&ids).await;
     if fetched.is_empty() {
-        return Highlights::default();
+        return (Highlights::default(), Vec::new());
     }
 
     // URL に名前が入っていない投稿も、ここで正しいアカウント名になる
@@ -322,11 +352,17 @@ async fn enrich_posts(enricher: &Enricher, posts: &mut [tally::SharedPost]) -> H
 
     let top_tweet = fetched.values().max_by_key(|info| info.likes).cloned();
     let texts: Vec<&str> = fetched.values().map(|info| info.text.as_str()).collect();
+    let hashtags = tally::count_hashtags(&texts);
+    let owned: Vec<String> = texts.into_iter().map(str::to_string).collect();
 
-    Highlights {
-        top_tweet,
-        hashtags: tally::count_hashtags(&texts),
-    }
+    (
+        Highlights {
+            top_tweet,
+            hashtags,
+            summary: None,
+        },
+        owned,
+    )
 }
 
 /// 文字数の上限で切り詰める。文字の途中で切らないようにする。
@@ -371,6 +407,13 @@ async fn main() {
     let allowed_channels = parse_channel_ids(&raw_channels)
         .unwrap_or_else(|e| panic!("ALLOWED_CHANNEL_IDSの解析に失敗しました: {e}"));
 
+    // AI総括は任意機能。キーが無ければ無効のまま起動する。
+    let summarizer = Summarizer::from_env();
+    match &summarizer {
+        Some(_) => println!("AI総括を有効にしました（定期投稿時のみ生成）"),
+        None => println!("ANTHROPIC_API_KEYが未設定のため、AI総括は無効です"),
+    }
+
     let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
     let handler = Handler {
@@ -378,6 +421,7 @@ async fn main() {
         bot: Arc::new(Bot {
             allowed_channels,
             enricher: Enricher::new().expect("HTTPクライアントの作成に失敗しました"),
+            summarizer,
         }),
         scheduler_started: AtomicBool::new(false),
     };
